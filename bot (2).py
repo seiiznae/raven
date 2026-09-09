@@ -21,7 +21,6 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN belum diset di environment variable")
 
-# Keamanan: daftar admin default. Owner pertama tidak boleh dihapus lewat panel.
 DEFAULT_ADMIN_IDS = {1137740036, 1779151962, 1943239073, 7186342193}
 OWNER_ID = 1137740036
 CHANNEL_ID = -1001967813918
@@ -58,7 +57,6 @@ Dapatkan akses Membership dan nikmati konten lengkap.
 👇 Pilih akses Anda:"""
 
 DEFAULT_FSUB_TEXT = "UNTUK FREE USER, SILAHKAN BERGABUNG TERLEBIH DAHULU KE GRUP DAN CHANNEL UTAMA KAMI UNTUK MENDAPATKAN FILE!!\n\nSETELAH BERGABUNG KE CHANNEL DAN GRUP, SILAHKAN TEKAN TOMBOL 🔄 CEK AKSES DI BAWAH UNTUK MENDAPATKAN FILE.\n\n━━━━━━━━━━━━━━━━━━━━\n\n💎 MEMBERSHIP NAKAHOSHI\n\nBosan menggunakan bot file?\nNggak perlu ribet cari file atau join sana-sini.\nLangsung saja tekan tombol ⭐ JOIN MEMBERSHIP di bawah!"
-
 DEFAULT_BANNED_TEXT = "🚫 AKUN KAMU TELAH DI-BANNED.\n\nJika merasa ini kesalahan, silakan hubungi Customer Service."
 DEFAULT_DENIED_TEXT = "🚫 COMMAND KHUSUS ADMIN.\n\nKamu tidak memiliki izin untuk menggunakan command ini."
 DEFAULT_NOT_FOUND_TEXT = "❌ File tidak ditemukan atau sudah tidak tersedia."
@@ -68,6 +66,7 @@ DEFAULT_DELETE_NOTICE = "⚠️ FILE INI AKAN DIHAPUS OTOMATIS DALAM {minutes} M
 DEFAULT_CS_TEXT = "🛠️ CUSTOMER SERVICE NAKAHOSHI\n\nJika terdapat masalah pada file, akses, atau akun, silakan hubungi admin kami."
 DEFAULT_UNBAN_TEXT = "🚫 Akun kamu sedang dibanned.\n\nSilakan ajukan permintaan unban kepada admin melalui tombol di bawah."
 DEFAULT_MAINTENANCE_TEXT = "🔧 NAKAHOSHI SEDANG DALAM PEMELIHARAAN.\n\nSilakan coba kembali nanti."
+DEFAULT_COMMAND_UNAVAILABLE = "❌ Command tidak tersedia."
 
 pending_batches = {}
 admin_sessions = {}
@@ -234,16 +233,32 @@ def get_batch(code):
     conn=db(); rows=conn.execute("SELECT * FROM batch_items WHERE batch_code=? ORDER BY id",(code,)).fetchall(); conn.close(); return rows
 
 
+def button_from_data(b, code=None):
+    if not isinstance(b,(list,tuple)) or len(b)<2: return None
+    label=str(b[0] or ""); kind=b[1]; value=b[2] if len(b)>2 else ""
+    style=b[3] if len(b)>3 and b[3] in {"primary","success","danger"} else None
+    icon_id=b[4] if len(b)>4 else None
+    kwargs={}
+    if kind=="check" and code: kwargs["callback_data"]=f"check:{code}"
+    elif kind=="url" and value: kwargs["url"]=value
+    else: return None
+    if style: kwargs["style"]=style
+    if icon_id: kwargs["icon_custom_emoji_id"]=str(icon_id)
+    try: return InlineKeyboardButton(label,**kwargs)
+    except TypeError:
+        kwargs.pop("style",None); kwargs.pop("icon_custom_emoji_id",None)
+        return InlineKeyboardButton(label,**kwargs)
+
+
 def build_keyboard(buttons, code=None):
     rows=[]
     for b in buttons or []:
-        if len(b)<2: continue
-        label=b[0]; kind=b[1]; value=b[2] if len(b)>2 else ""
-        if kind=="check" and code: btn=InlineKeyboardButton(label,callback_data=f"check:{code}")
-        elif kind=="url" and value: btn=InlineKeyboardButton(label,url=value)
-        else: continue
-        if not rows or len(rows[-1])>=2: rows.append([])
-        rows[-1].append(btn)
+        if isinstance(b,dict): b=[b.get("label",""),b.get("kind","url"),b.get("value",""),b.get("style"),b.get("icon_custom_emoji_id"),b.get("row_mode","new")]
+        btn=button_from_data(b,code)
+        if not btn: continue
+        row_mode=b[5] if len(b)>5 else "new"
+        if row_mode=="same" and rows: rows[-1].append(btn)
+        else: rows.append([btn])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -255,7 +270,7 @@ def access_keyboard(code):
 def start_keyboard(): return build_keyboard(get_config("start_config").get("buttons"))
 
 
-async def member_is_inside(bot, chat_id, user_id):
+async def member_is_inside(bot,chat_id,user_id):
     try:
         member=await bot.get_chat_member(chat_id,user_id)
         return member.status in {"member","administrator","creator","restricted"}
@@ -269,30 +284,41 @@ async def check_access(bot,user_id):
     return await member_is_inside(bot,CHANNEL_ID,user_id) and await member_is_inside(bot,FREE_GROUP_ID,user_id)
 
 
-def protect(): return get_setting("protect_content") == "1"
+def protect_for(chat_id): return False if is_admin(chat_id) else get_setting("protect_content")=="1"
+def protect(): return get_setting("protect_content")=="1"
 
 
-async def send_cfg(chat_id, cfg, bot, code=None, reply_markup=None, protect_content=None):
+async def send_cfg(chat_id,cfg,bot,code=None,reply_markup=None,protect_content=None):
+    cfg=cfg if isinstance(cfg,dict) else cfg_json()
     markup=reply_markup or build_keyboard(cfg.get("buttons"),code)
-    entities=deserialize_entities(json.dumps(cfg.get("entities",[]),ensure_ascii=False))
-    text=cfg.get("text") or ""
-    kwargs={"chat_id":chat_id,"protect_content":protect() if protect_content is None else protect_content}
+    entities=deserialize_entities(cfg.get("entities",[])); text=cfg.get("text") or ""
+    protected=protect_for(chat_id) if protect_content is None else protect_content
+    kwargs={"chat_id":chat_id,"protect_content":protected}
     if markup: kwargs["reply_markup"]=markup
     media_id=cfg.get("media_id"); media_type=cfg.get("media_type")
     if media_id:
-        if text: kwargs["caption"]=text; kwargs["caption_entities"]=entities
+        if text:
+            kwargs["caption"]=text; kwargs["caption_entities"]=entities
         if media_type=="photo": return await bot.send_photo(photo=media_id,**kwargs)
         if media_type=="video": return await bot.send_video(video=media_id,**kwargs)
         if media_type=="animation": return await bot.send_animation(animation=media_id,**kwargs)
         if media_type=="document": return await bot.send_document(document=media_id,**kwargs)
         if media_type=="audio": return await bot.send_audio(audio=media_id,**kwargs)
+        if media_type=="voice": return await bot.send_voice(voice=media_id,**kwargs)
+        if media_type=="video_note":
+            note_kwargs=dict(kwargs); note_kwargs.pop("reply_markup",None); note_kwargs.pop("caption",None); note_kwargs.pop("caption_entities",None)
+            msg=await bot.send_video_note(video_note=media_id,**note_kwargs)
+            if text: await bot.send_message(chat_id=chat_id,text=text,entities=entities,reply_markup=markup,protect_content=protected)
+            elif markup: await bot.send_message(chat_id=chat_id,text="\u2063",reply_markup=markup,protect_content=protected)
+            return msg
     if text: return await bot.send_message(text=text,entities=entities,**kwargs)
+    if markup: return await bot.send_message(text="\u2063",**kwargs)
     return None
 
 
 async def send_file(chat_id,item,bot):
     entities=deserialize_entities(item["caption_entities"] if "caption_entities" in item.keys() else "[]")
-    kwargs={"chat_id":chat_id,"protect_content":protect()}
+    kwargs={"chat_id":chat_id,"protect_content":protect_for(chat_id)}
     if item["caption"]: kwargs["caption"]=item["caption"]; kwargs["caption_entities"]=entities
     t=item["file_type"]; fid=item["file_id"]
     if t=="video": return await bot.send_video(video=fid,**kwargs)
@@ -300,10 +326,11 @@ async def send_file(chat_id,item,bot):
     if t=="animation": return await bot.send_animation(animation=fid,**kwargs)
     if t=="document": return await bot.send_document(document=fid,**kwargs)
     if t=="audio": return await bot.send_audio(audio=fid,**kwargs)
+    if t=="voice": return await bot.send_voice(voice=fid,**kwargs)
     return None
 
 
-async def schedule_delete(context, chat_id, message_ids, minutes):
+async def schedule_delete(context,chat_id,message_ids,minutes):
     async def task():
         await asyncio.sleep(minutes*60)
         for mid in message_ids:
@@ -326,16 +353,14 @@ async def deliver(update,context,code):
         msg=await send_file(chat_id,row,context.bot)
         if msg: sent.append(msg.message_id)
     if sent and get_setting("auto_delete_enabled")=="1":
-        minutes=max(1,int(get_setting("auto_delete_minutes") or "10"))
-        notice=get_config("auto_delete_notice"); notice["text"]=(notice.get("text") or DEFAULT_DELETE_NOTICE).replace("{minutes}",str(minutes))
-        nmsg=await send_cfg(chat_id,notice,context.bot)
+        minutes=max(1,int(get_setting("auto_delete_minutes") or "10")); notice=get_config("auto_delete_notice"); notice["text"]=(notice.get("text") or DEFAULT_DELETE_NOTICE).replace("{minutes}",str(minutes)); nmsg=await send_cfg(chat_id,notice,context.bot)
         if nmsg: sent.append(nmsg.message_id)
         await schedule_delete(context,chat_id,sent,minutes)
 
 
 async def show_page(update,context,command):
     row=user_command(command)
-    if not row or not row["enabled"]: await update.message.reply_text("❌ Command tidak tersedia.",protect_content=protect()); return
+    if not row or not row["enabled"]: await send_cfg(update.effective_chat.id,cfg_json(DEFAULT_COMMAND_UNAVAILABLE),context.bot); return
     await send_cfg(update.effective_chat.id,json.loads(row["config"]),context.bot)
 
 
@@ -355,102 +380,112 @@ async def check_button(update,context):
     q=update.callback_query
     if is_banned(q.from_user.id): await q.answer("🚫 Kamu sedang dibanned.",show_alert=True); return
     if not await check_access(context.bot,q.from_user.id): await q.answer("❌ Kamu belum memenuhi syarat akses.",show_alert=True); return
-    await q.answer()
-    try: await q.edit_message_text(get_config("access_ok_message").get("text") or DEFAULT_ACCESS_OK_TEXT)
+    await q.answer(); cfg=get_config("access_ok_message")
+    try: await q.edit_message_text(cfg.get("text") or DEFAULT_ACCESS_OK_TEXT,entities=deserialize_entities(cfg.get("entities",[])),reply_markup=build_keyboard(cfg.get("buttons")))
     except Exception: pass
     await deliver(update,context,q.data.split(":",1)[1])
 
 
-# ---------- Admin editor ----------
+# ---------- Admin navigation/editor ----------
 def admin_home_markup():
     return InlineKeyboardMarkup([[InlineKeyboardButton("📊 Statistik",callback_data="adm:stats"),InlineKeyboardButton("📁 File",callback_data="adm:files")],[InlineKeyboardButton("🎨 Start",callback_data="adm:page:start"),InlineKeyboardButton("📢 FSUB",callback_data="adm:page:fsub")],[InlineKeyboardButton("👤 User Command",callback_data="adm:commands"),InlineKeyboardButton("📝 System Message",callback_data="adm:system")],[InlineKeyboardButton("👑 Admin",callback_data="adm:admins"),InlineKeyboardButton("🚫 Ban User",callback_data="adm:bans")],[InlineKeyboardButton("🗑️ Auto Delete",callback_data="adm:autodel"),InlineKeyboardButton("📢 Broadcast",callback_data="adm:broadcast")],[InlineKeyboardButton("💾 Backup",callback_data="adm:backup"),InlineKeyboardButton("🔧 Maintenance",callback_data="adm:maintenance")]])
-
 
 def back_home(): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]])
 def cancel_kb(): return InlineKeyboardMarkup([[InlineKeyboardButton("❌ BATAL",callback_data="adm:cancel")]])
 
-
 def editor_menu(uid,target):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Text",callback_data=f"edit:text:{target}"),InlineKeyboardButton("🖼️ Media",callback_data=f"edit:media:{target}")],[InlineKeyboardButton("🔘 Buttons",callback_data=f"edit:buttons:{target}"),InlineKeyboardButton("👁️ Preview",callback_data=f"edit:preview:{target}")],[InlineKeyboardButton("💾 Simpan",callback_data=f"edit:save:{target}"),InlineKeyboardButton("🗑️ Hapus Media",callback_data=f"edit:delmedia:{target}")],[InlineKeyboardButton("❌ Batal",callback_data="adm:cancel")]])
-
+    rows=[[InlineKeyboardButton("📝 Text",callback_data=f"edit:text:{target}"),InlineKeyboardButton("🖼️ Media",callback_data=f"edit:media:{target}")]]
+    if target.startswith("cmd/"): rows.append([InlineKeyboardButton("🗒️ Deskripsi",callback_data=f"edit:desc:{target}")])
+    rows += [[InlineKeyboardButton("🔘 Buttons",callback_data=f"edit:buttons:{target}"),InlineKeyboardButton("👁️ Preview",callback_data=f"edit:preview:{target}")],[InlineKeyboardButton("💾 Simpan",callback_data=f"edit:save:{target}"),InlineKeyboardButton("🗑️ Hapus Media",callback_data=f"edit:delmedia:{target}")],[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:back")]]
+    return InlineKeyboardMarkup(rows)
 
 def load_target(target):
     if target=="start":
         cfg=get_config("start_config")
-        if not cfg.get("text") and (get_setting("start_text") or get_setting("start_media")):
-            cfg=cfg_json(get_setting("start_text"),deserialize_entities(get_setting("start_entities")),get_setting("start_media"),get_setting("start_media_type"),[["⭐ JOIN MEMBERSHIP","url",get_setting("payment_link")],["📢 JOIN CHANNEL","url",get_setting("channel_link")],["👥 JOIN GROUP","url",get_setting("free_group_link")],["👤 OWNER BOT","url",get_setting("owner_link")]])
+        if not cfg.get("text") and (get_setting("start_text") or get_setting("start_media")): cfg=cfg_json(get_setting("start_text"),deserialize_entities(get_setting("start_entities")),get_setting("start_media"),get_setting("start_media_type"),[["⭐ JOIN MEMBERSHIP","url",get_setting("payment_link")],["📢 JOIN CHANNEL","url",get_setting("channel_link")],["👥 JOIN GROUP","url",get_setting("free_group_link")],["👤 OWNER BOT","url",get_setting("owner_link")]])
         return cfg
     if target=="fsub": return get_config("fsub_config")
     if target.startswith("cmd/"):
-        row=user_command(target[4:]); return json.loads(row["config"]) if row else None
+        row=user_command(target[4:]); return json.loads(row["config"]) if row else cfg_json()
     return get_config(target)
 
-
 def save_target(target,cfg):
-    if target=="start":
-        set_config("start_config",cfg); set_setting("start_text",cfg.get("text", "")); set_setting("start_entities",json.dumps(cfg.get("entities",[]),ensure_ascii=False)); set_setting("start_media",cfg.get("media_id", "")); set_setting("start_media_type",cfg.get("media_type", ""))
+    if target=="start": set_config("start_config",cfg); set_setting("start_text",cfg.get("text","")); set_setting("start_entities",json.dumps(cfg.get("entities",[]),ensure_ascii=False)); set_setting("start_media",cfg.get("media_id","")); set_setting("start_media_type",cfg.get("media_type",""))
     elif target=="fsub": set_config("fsub_config",cfg)
     elif target.startswith("cmd/"):
         conn=db(); conn.execute("UPDATE user_commands SET config=? WHERE command=?",(json.dumps(cfg,ensure_ascii=False),target[4:])); conn.commit(); conn.close()
     else: set_config(target,cfg)
 
-
 def session(uid,target):
-    s=admin_sessions.setdefault(uid,{}); s["target"]=target; s["draft"]=json.loads(json.dumps(load_target(target),ensure_ascii=False)); return s
+    s=admin_sessions.setdefault(uid,{}); s["target"]=target; s["draft"]=json.loads(json.dumps(load_target(target),ensure_ascii=False)); s.setdefault("nav",[])
+    if not s["nav"]: s["nav"].append({"text":f"⚙️ EDIT {target.upper()}","markup":editor_menu(uid,target).to_dict()})
+    s["action"]="editor"; return s
+
+def clear_session(uid): admin_sessions.pop(uid,None); pending_batches.pop(uid,None)
 
 
 async def admin_command(update,context):
-    if not is_admin(update.effective_user.id):
-        await send_cfg(update.effective_chat.id,get_config("denied_message"),context.bot); return
-    await update.message.reply_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup(),protect_content=protect())
+    uid=update.effective_user.id
+    if not is_admin(uid): await send_cfg(update.effective_chat.id,get_config("denied_message"),context.bot); return
+    admin_sessions[uid]={"nav":[{"text":"👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:","markup":admin_home_markup().to_dict()}]}
+    await update.message.reply_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup(),protect_content=False)
 
 
 async def admin_callback(update,context):
     q=update.callback_query; uid=q.from_user.id
     if not is_admin(uid): await q.answer("Tidak punya akses.",show_alert=True); return
     await q.answer(); data=q.data
-    if data in ("adm:home","adm:cancel"): admin_sessions.pop(uid,None); await q.edit_message_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup()); return
+    if data=="adm:home": clear_session(uid); admin_sessions[uid]={"nav":[{"text":"👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:","markup":admin_home_markup().to_dict()}]}; await q.edit_message_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup()); return
+    if data=="adm:back":
+        s=admin_sessions.get(uid,{}); nav=s.get("nav",[])
+        if len(nav)>1:
+            nav.pop(); prev=nav[-1]; markup=InlineKeyboardMarkup.de_json(prev.get("markup"),context.bot) if prev.get("markup") else None; await q.edit_message_text(prev.get("text",""),reply_markup=markup)
+        else: await q.edit_message_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup())
+        return
+    if data=="adm:cancel":
+        s=admin_sessions.get(uid,{}); target=s.get("target")
+        if target: s["draft"]=json.loads(json.dumps(load_target(target),ensure_ascii=False)); s["action"]="editor"; await q.edit_message_text(f"⚙️ EDIT {target.upper()}\n\nDraft dibatalkan. Perubahan belum disimpan.",reply_markup=editor_menu(uid,target))
+        else: clear_session(uid); await q.edit_message_text("👑 NAKAHOSHI ADMIN PANEL\n\nPilih menu:",reply_markup=admin_home_markup())
+        return
     if data=="adm:stats":
         conn=db(); vals=[conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0],conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],conn.execute("SELECT COUNT(*) FROM banned_users").fetchone()[0]]; conn.close(); await q.edit_message_text(f"📊 STATISTIK\n\n📁 File: {vals[0]}\n📦 Batch: {vals[1]}\n👥 User: {vals[2]}\n🚫 Banned: {vals[3]}",reply_markup=back_home()); return
     if data=="adm:files":
-        conn=db(); rows=conn.execute("SELECT code,file_type FROM files ORDER BY rowid DESC LIMIT 20").fetchall(); conn.close(); await q.edit_message_text("📁 FILE TERBARU\n\n"+(("\n".join(f"{r['code']} — {r['file_type']}" for r in rows)) if rows else "Belum ada file."),reply_markup=back_home()); return
+        conn=db(); rows=conn.execute("SELECT code,file_type FROM files ORDER BY rowid DESC LIMIT 20").fetchall(); conn.close(); await q.edit_message_text("📁 FILE TERBARU\n\n"+("\n".join(f"{r['code']} — {r['file_type']}" for r in rows) if rows else "Belum ada file."),reply_markup=back_home()); return
     if data in ("adm:page:start","adm:page:fsub"):
         target="start" if data.endswith("start") else "fsub"; session(uid,target); await q.edit_message_text(f"⚙️ EDIT {target.upper()}\n\nMedia + Text + Buttons + Preview.\nSemua perubahan masih draft sampai disimpan.",reply_markup=editor_menu(uid,target)); return
     if data=="adm:commands":
-        conn=db(); rows=conn.execute("SELECT command,description,enabled FROM user_commands ORDER BY command").fetchall(); conn.close(); kb=[]
-        for r in rows: kb.append([InlineKeyboardButton(("🟢 " if r["enabled"] else "🔴 ")+"/"+r["command"],callback_data=f"adm:cmd:{r['command']}")])
-        kb.append([InlineKeyboardButton("➕ Tambah Command",callback_data="adm:addcmd")]); kb.append([InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]); await q.edit_message_text("👤 USER COMMAND\n\nPilih command:",reply_markup=InlineKeyboardMarkup(kb)); return
+        conn=db(); rows=conn.execute("SELECT command,description,enabled FROM user_commands ORDER BY command").fetchall(); conn.close(); kb=[[InlineKeyboardButton(("🟢 " if r["enabled"] else "🔴 ")+"/"+r["command"],callback_data=f"adm:cmd:{r['command']}")] for r in rows]; kb.append([InlineKeyboardButton("➕ Tambah Command",callback_data="adm:addcmd")]); kb.append([InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]); await q.edit_message_text("👤 USER COMMAND\n\nPilih command:",reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("adm:cmd:"):
-        command=data.split(":",2)[2]; session(uid,"cmd/"+command); row=user_command(command); status="🟢 AKTIF" if row and row["enabled"] else "🔴 NONAKTIF"; base=editor_menu(uid,"cmd/"+command).inline_keyboard; base.append([InlineKeyboardButton("🔄 Aktif/Nonaktif",callback_data=f"adm:toggle:{command}"),InlineKeyboardButton("🗑️ Hapus",callback_data=f"adm:deletecmd:{command}")]); await q.edit_message_text(f"⚙️ EDIT /{command}\nStatus: {status}\n\nMedia + Text + Buttons + Preview",reply_markup=InlineKeyboardMarkup(base)); return
-    if data=="adm:addcmd": admin_sessions[uid]={"action":"add_command"}; await q.edit_message_text("➕ TAMBAH COMMAND\n\nKirim format:\n/nama | Deskripsi",reply_markup=cancel_kb()); return
+        command=data.split(":",2)[2]; session(uid,"cmd/"+command); row=user_command(command); status="🟢 AKTIF" if row and row["enabled"] else "🔴 NONAKTIF"; base=editor_menu(uid,"cmd/"+command).inline_keyboard; base.append([InlineKeyboardButton("🔄 Aktif/Nonaktif",callback_data=f"adm:toggle:{command}"),InlineKeyboardButton("🗑️ Hapus",callback_data=f"adm:deletecmd:{command}")]); await q.edit_message_text(f"⚙️ EDIT /{command}\nStatus: {status}\nDeskripsi: {(row['description'] if row else '-')[:256]}\n\nMedia + Text + Buttons + Preview",reply_markup=InlineKeyboardMarkup(base)); return
+    if data=="adm:addcmd": admin_sessions[uid]={"action":"add_command","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("➕ TAMBAH COMMAND\n\nKirim format:\n/nama | Deskripsi",reply_markup=cancel_kb()); return
     if data.startswith("adm:toggle:"):
         command=data.split(":",2)[2]; conn=db(); row=conn.execute("SELECT enabled FROM user_commands WHERE command=?",(command,)).fetchone();
         if row: conn.execute("UPDATE user_commands SET enabled=? WHERE command=?",(0 if row["enabled"] else 1,command)); conn.commit()
         conn.close(); await refresh_command_menus(context.bot); await q.edit_message_text(f"🔄 /{command} diubah statusnya.",reply_markup=back_home()); return
     if data.startswith("adm:deletecmd:"):
-        command=data.split(":",2)[2]; conn=db(); conn.execute("DELETE FROM user_commands WHERE command=?",(command,)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await refresh_command_menus(context.bot); await q.edit_message_text(f"🗑️ /{command} dihapus.",reply_markup=back_home()); return
+        command=data.split(":",2)[2]; conn=db(); conn.execute("DELETE FROM user_commands WHERE command=?",(command,)); conn.commit(); conn.close(); clear_session(uid); await refresh_command_menus(context.bot); await q.edit_message_text(f"🗑️ /{command} dihapus.",reply_markup=back_home()); return
     if data=="adm:system":
-        keys=[("banned_message","🚫 Pesan Banned"),("denied_message","⛔ Command Admin Ditolak"),("not_found_message","❌ File Tidak Ditemukan"),("invalid_link_message","🔗 Link Tidak Valid"),("access_ok_message","✅ Akses OK"),("cs_config","🛠️ Customer Service"),("unban_config","♻️ Unban"),("auto_delete_notice","🗑️ Notifikasi Auto Delete")]; kb=[[InlineKeyboardButton(label,callback_data=f"adm:sys:{key}")] for key,label in keys]; kb.append([InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]); await q.edit_message_text("📝 SYSTEM MESSAGE\n\nPilih pesan:",reply_markup=InlineKeyboardMarkup(kb)); return
+        keys=[("banned_message","🚫 Pesan Banned"),("denied_message","⛔ Command Admin Ditolak"),("not_found_message","❌ File Tidak Ditemukan"),("invalid_link_message","🔗 Link Tidak Valid"),("access_ok_message","✅ Akses OK"),("cs_config","🛠️ Customer Service"),("unban_config","♻️ Unban"),("auto_delete_notice","🗑️ Notifikasi Auto Delete"),("maintenance_config","🔧 Maintenance")]; kb=[[InlineKeyboardButton(label,callback_data=f"adm:sys:{key}")] for key,label in keys]; kb.append([InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]); await q.edit_message_text("📝 SYSTEM MESSAGE\n\nPilih pesan:",reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("adm:sys:"):
         target=data.split(":",2)[2]; session(uid,target); await q.edit_message_text("📝 EDIT SYSTEM MESSAGE\n\nBisa Text + Media + Buttons + Preview.",reply_markup=editor_menu(uid,target)); return
     if data=="adm:admins":
         conn=db(); rows=conn.execute("SELECT user_id FROM admins ORDER BY user_id").fetchall(); conn.close(); text="👑 ADMIN\n\n"+"\n".join(f"{r['user_id']}"+((" — OWNER") if r['user_id']==OWNER_ID else "") for r in rows); kb=[[InlineKeyboardButton("➕ Tambah Admin",callback_data="adm:addadmin")],[InlineKeyboardButton("🗑️ Hapus Admin",callback_data="adm:deladmin")],[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]]; await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
-    if data=="adm:addadmin": admin_sessions[uid]={"action":"add_admin"}; await q.edit_message_text("➕ TAMBAH ADMIN\n\nKirim Telegram User ID.",reply_markup=cancel_kb()); return
-    if data=="adm:deladmin": admin_sessions[uid]={"action":"del_admin"}; await q.edit_message_text("🗑️ HAPUS ADMIN\n\nKirim Telegram User ID. Owner tidak dapat dihapus.",reply_markup=cancel_kb()); return
+    if data=="adm:addadmin": admin_sessions[uid]={"action":"add_admin","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("➕ TAMBAH ADMIN\n\nKirim Telegram User ID.",reply_markup=cancel_kb()); return
+    if data=="adm:deladmin": admin_sessions[uid]={"action":"del_admin","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("🗑️ HAPUS ADMIN\n\nKirim Telegram User ID. Owner tidak dapat dihapus.",reply_markup=cancel_kb()); return
     if data=="adm:bans":
-        conn=db(); rows=conn.execute("SELECT user_id,reason FROM banned_users ORDER BY banned_at DESC LIMIT 50").fetchall(); conn.close(); text="🚫 BANNED USERS\n\n"+(("\n".join(f"{r['user_id']} — {r['reason'] or '-'}" for r in rows)) if rows else "Belum ada user banned."); kb=[[InlineKeyboardButton("🔨 Ban User",callback_data="adm:ban")],[InlineKeyboardButton("♻️ Unban User",callback_data="adm:unban")],[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]]; await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
-    if data=="adm:ban": admin_sessions[uid]={"action":"ban"}; await q.edit_message_text("🔨 BAN USER\n\nKirim User ID.\nOpsional alasan: 123456789 | alasan",reply_markup=cancel_kb()); return
-    if data=="adm:unban": admin_sessions[uid]={"action":"unban"}; await q.edit_message_text("♻️ UNBAN USER\n\nKirim User ID.",reply_markup=cancel_kb()); return
+        conn=db(); rows=conn.execute("SELECT user_id,reason FROM banned_users ORDER BY banned_at DESC LIMIT 50").fetchall(); conn.close(); text="🚫 BANNED USERS\n\n"+("\n".join(f"{r['user_id']} — {r['reason'] or '-'}" for r in rows) if rows else "Belum ada user banned."); kb=[[InlineKeyboardButton("🔨 Ban User",callback_data="adm:ban")],[InlineKeyboardButton("♻️ Unban User",callback_data="adm:unban")],[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]]; await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(kb)); return
+    if data=="adm:ban": admin_sessions[uid]={"action":"ban","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("🔨 BAN USER\n\nKirim User ID.\nOpsional alasan: 123456789 | alasan",reply_markup=cancel_kb()); return
+    if data=="adm:unban": admin_sessions[uid]={"action":"unban","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("♻️ UNBAN USER\n\nKirim User ID.",reply_markup=cancel_kb()); return
     if data=="adm:autodel":
         status="🟢 AKTIF" if get_setting("auto_delete_enabled")=="1" else "🔴 NONAKTIF"; await q.edit_message_text(f"🗑️ AUTO DELETE FILE\n\nStatus: {status}\nWaktu: {get_setting('auto_delete_minutes')} menit",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Aktifkan",callback_data="adm:ad:on"),InlineKeyboardButton("🔴 Matikan",callback_data="adm:ad:off")],[InlineKeyboardButton("⏱️ Atur Waktu",callback_data="adm:ad:time"),InlineKeyboardButton("📝 Notifikasi",callback_data="adm:ad:msg")],[InlineKeyboardButton("⬅️ Kembali",callback_data="adm:home")]])); return
     if data=="adm:ad:on": set_setting("auto_delete_enabled","1"); await q.edit_message_text("🟢 Auto Delete aktif.",reply_markup=back_home()); return
     if data=="adm:ad:off": set_setting("auto_delete_enabled","0"); await q.edit_message_text("🔴 Auto Delete dimatikan.",reply_markup=back_home()); return
-    if data=="adm:ad:time": admin_sessions[uid]={"action":"ad_time"}; await q.edit_message_text("⏱️ Kirim jumlah menit. Contoh: 10",reply_markup=cancel_kb()); return
+    if data=="adm:ad:time": admin_sessions[uid]={"action":"ad_time","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("⏱️ Kirim jumlah menit. Contoh: 10",reply_markup=cancel_kb()); return
     if data=="adm:ad:msg": session(uid,"auto_delete_notice"); await q.edit_message_text("📝 EDIT NOTIFIKASI AUTO DELETE",reply_markup=editor_menu(uid,"auto_delete_notice")); return
-    if data=="adm:broadcast": admin_sessions[uid]={"action":"broadcast"}; await q.edit_message_text("📢 BROADCAST\n\nKirim satu pesan/media yang ingin dibroadcast.\nSetelah itu gunakan /broadcast_confirm untuk mengirim.",reply_markup=cancel_kb()); return
+    if data=="adm:broadcast": admin_sessions[uid]={"action":"broadcast","nav":admin_sessions.get(uid,{}).get("nav",[])}; await q.edit_message_text("📢 BROADCAST\n\nKirim satu pesan/media yang ingin dibroadcast.\nSetelah itu gunakan /broadcast_confirm untuk mengirim.",reply_markup=cancel_kb()); return
     if data=="adm:backup":
         try:
-            with open(DB_NAME,"rb") as f: await context.bot.send_document(uid,f,caption="💾 Backup database NakaFileBOT",protect_content=True)
+            with open(DB_NAME,"rb") as f: await context.bot.send_document(uid,f,caption="💾 Backup database NakaFileBOT",protect_content=False)
         except Exception as e: await q.answer("Backup gagal: "+str(e)[:150],show_alert=True)
         return
     if data=="adm:maintenance":
@@ -462,22 +497,24 @@ async def admin_callback(update,context):
         _,action,target=data.split(":",2); s=admin_sessions.get(uid)
         if not s or s.get("target")!=target: session(uid,target); s=admin_sessions[uid]
         cfg=s["draft"]
-        if action=="text": s["action"]="edit_text"; await q.edit_message_text("📝 KIRIM TEKS BARU\n\nKirim pesan langsung dari Telegram. Formatting Telegram akan ikut tersimpan.",reply_markup=cancel_kb()); return
-        if action=="media": s["action"]="edit_media"; await q.edit_message_text("🖼️ KIRIM MEDIA\n\nBisa Foto, GIF/Animation, Video, Dokumen, atau Audio.",reply_markup=cancel_kb()); return
+        if action=="text": s["action"]="edit_text"; await q.edit_message_text("📝 KIRIM TEKS BARU\n\nFormatting + Premium Custom Emoji akan ikut tersimpan.",reply_markup=cancel_kb()); return
+        if action=="desc": s["action"]="edit_desc"; await q.edit_message_text("🗒️ KIRIM DESKRIPSI COMMAND BARU\n\nTeks ini adalah bacaan/description command yang muncul di menu Telegram.",reply_markup=cancel_kb()); return
+        if action=="media": s["action"]="edit_media"; await q.edit_message_text("🖼️ KIRIM MEDIA\n\nBisa Foto, GIF/Animation, Video, Dokumen, Audio, Voice, atau Video Note.\n\nMedia masuk ke draft dan baru permanen setelah SIMPAN.",reply_markup=cancel_kb()); return
         if action=="delmedia": cfg["media_id"]=""; cfg["media_type"]=""; await q.edit_message_text("🗑️ Media di draft sudah dihapus. Belum tersimpan.",reply_markup=editor_menu(uid,target)); return
         if action=="buttons": await show_buttons(q,uid,target); return
         if action=="preview": await preview_cfg(q,context,uid,target,cfg); return
+        if action=="previewback": await q.edit_message_text(f"⚙️ EDIT {target.upper()}\n\nMedia + Text + Buttons + Preview.\nSemua perubahan masih draft sampai disimpan.",reply_markup=editor_menu(uid,target)); return
         if action=="save": save_target(target,cfg); admin_sessions.pop(uid,None); await q.edit_message_text("💾 PERUBAHAN TERSIMPAN.\n\nSetting lama sudah diganti dengan draft ini.",reply_markup=back_home()); return
 
 
 async def show_buttons(q,uid,target):
     cfg=admin_sessions[uid]["draft"]; buttons=cfg.get("buttons",[]); kb=[]
     for i,b in enumerate(buttons): kb.append([InlineKeyboardButton(f"✏️ {b[0]}",callback_data=f"btn:edit:{target}:{i}"),InlineKeyboardButton("🗑️",callback_data=f"btn:del:{target}:{i}")])
-    kb.append([InlineKeyboardButton("➕ Tambah Button",callback_data=f"btn:add:{target}")]); kb.append([InlineKeyboardButton("⬅️ Editor",callback_data=f"btn:back:{target}")]); await q.edit_message_text("🔘 BUTTON MANAGER\n\nSemua perubahan masih di draft.",reply_markup=InlineKeyboardMarkup(kb))
+    kb.append([InlineKeyboardButton("➕ Tambah Button",callback_data=f"btn:add:{target}")]); kb.append([InlineKeyboardButton("⬅️ Editor",callback_data=f"btn:back:{target}")]); await q.edit_message_text("🔘 BUTTON MANAGER\n\nSemua perubahan masih di draft.\n\nFormat: Nama Tombol | URL | #g/#r/#p | custom_emoji_id\nGunakan && untuk satu baris.",reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def preview_cfg(q,context,uid,target,cfg):
-    await q.edit_message_text("👁️ PREVIEW\n\nPreview lengkap sedang dikirim di bawah...",reply_markup=back_home()); await send_cfg(q.message.chat_id,cfg,context.bot,protect_content=False)
+    await q.edit_message_text("👁️ PREVIEW\n\nPesan final draft di bawah. Belum disimpan.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Editor",callback_data=f"edit:previewback:{target}")]])); await send_cfg(q.message.chat_id,cfg,context.bot,protect_content=False)
 
 
 async def button_callback(update,context):
@@ -486,19 +523,19 @@ async def button_callback(update,context):
     data=q.data.split(":"); action,target=data[1],data[2]; s=admin_sessions.get(uid)
     if not s or s.get("target")!=target: await q.answer("Draft sudah tidak aktif.",show_alert=True); return
     cfg=s["draft"]
-    if action=="back": await q.answer(); await q.edit_message_text("⚙️ EDITOR\n\nPilih bagian:",reply_markup=editor_menu(uid,target)); return
-    if action=="add": s["action"]="add_button"; await q.answer(); await q.edit_message_text("➕ TAMBAH BUTTON\n\nKirim format:\nNama Tombol | URL",reply_markup=cancel_kb()); return
+    if action=="back": await q.answer(); await q.edit_message_text(f"⚙️ EDIT {target.upper()}\n\nMedia + Text + Buttons + Preview.\nSemua perubahan masih draft sampai disimpan.",reply_markup=editor_menu(uid,target)); return
+    if action=="add": s["action"]="add_button"; await q.answer(); await q.edit_message_text("➕ TAMBAH BUTTON\n\nKirim format:\nNama Tombol | URL | #g/#r/#p | custom_emoji_id\n\nKamu juga bisa mengirim beberapa tombol sekaligus. Pisahkan tombol satu baris dengan &&.",reply_markup=cancel_kb()); return
     idx=int(data[3])
     if action=="del": cfg["buttons"].pop(idx); await q.answer("Button dihapus dari draft."); await show_buttons(q,uid,target); return
-    if action=="edit": s["action"]="edit_button"; s["button_index"]=idx; await q.answer(); await q.edit_message_text(f"✏️ EDIT BUTTON\n\nSaat ini: {cfg['buttons'][idx][0]}\nURL: {cfg['buttons'][idx][2] if len(cfg['buttons'][idx])>2 else ''}\n\nKirim format baru:\nNama Tombol | URL",reply_markup=cancel_kb()); return
+    if action=="edit":
+        s["action"]="edit_button"; s["button_index"]=idx; b=cfg["buttons"][idx]; await q.answer(); await q.edit_message_text(f"✏️ EDIT BUTTON\n\nSaat ini: {b[0]}\nURL: {b[2] if len(b)>2 else ''}\nStyle: {b[3] if len(b)>3 else '-'}\nCustom Emoji ID: {b[4] if len(b)>4 else '-'}\n\nKirim format:\nNama Tombol | URL | #g/#r/#p | custom_emoji_id",reply_markup=cancel_kb()); return
 
 
 async def receive_admin_media(update,context):
     uid=update.effective_user.id
     if not is_admin(uid): return
     save_user(update.effective_user); s=admin_sessions.get(uid); msg=update.message; action=s.get("action") if s else None
-    if action=="broadcast":
-        s["broadcast_message_id"]=msg.message_id; s["broadcast_chat_id"]=uid; s["action"]="broadcast_confirm"; await msg.reply_text("📢 Pesan siap dibroadcast.\n\nKetik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal."); return
+    if action=="broadcast": s["broadcast_message_id"]=msg.message_id; s["broadcast_chat_id"]=uid; s["action"]="broadcast_confirm"; await msg.reply_text("📢 Pesan siap dibroadcast.\n\nKetik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal.",protect_content=False); return
     if action=="edit_media":
         cfg=s["draft"]
         if msg.photo: cfg["media_id"]=msg.photo[-1].file_id; cfg["media_type"]="photo"
@@ -506,103 +543,125 @@ async def receive_admin_media(update,context):
         elif msg.animation: cfg["media_id"]=msg.animation.file_id; cfg["media_type"]="animation"
         elif msg.document: cfg["media_id"]=msg.document.file_id; cfg["media_type"]="document"
         elif msg.audio: cfg["media_id"]=msg.audio.file_id; cfg["media_type"]="audio"
+        elif msg.voice: cfg["media_id"]=msg.voice.file_id; cfg["media_type"]="voice"
+        elif msg.video_note: cfg["media_id"]=msg.video_note.file_id; cfg["media_type"]="video_note"
         else: return
         if msg.caption is not None: cfg["text"]=msg.caption; cfg["entities"]=serialize_entities(msg.caption_entities)
-        s["action"]="editor"; await msg.reply_text("🖼️ Media masuk ke draft. Belum disimpan.",reply_markup=editor_menu(uid,s["target"])); return
-    if action in (None,"editor") and (msg.photo or msg.video or msg.animation or msg.document or msg.audio):
-        file_id=msg.photo[-1].file_id if msg.photo else (msg.video.file_id if msg.video else (msg.animation.file_id if msg.animation else (msg.document.file_id if msg.document else msg.audio.file_id)))
-        ftype="photo" if msg.photo else ("video" if msg.video else ("animation" if msg.animation else ("document" if msg.document else "audio")))
-        item=(file_id,ftype,msg.caption or "",msg.caption_entities or [])
-        pending=pending_batches.get(uid)
-        if pending is not None: pending.append(item); await msg.reply_text(f"✅ Ditambahkan ke batch. Total: {len(pending)} file."); return
-        code=create_file_record(*item); await msg.reply_text(f"✅ File tersimpan!\n\n🔗 Link:\nhttps://t.me/{context.bot.username}?start={code}\n\nCode: {code}"); return
+        s["action"]="editor"; await msg.reply_text("🖼️ Media masuk ke draft. Belum disimpan.",reply_markup=editor_menu(uid,s["target"]),protect_content=False); return
+    if action in (None,"editor") and (msg.photo or msg.video or msg.animation or msg.document or msg.audio or msg.voice or msg.video_note):
+        if msg.photo: file_id=msg.photo[-1].file_id; ftype="photo"
+        elif msg.video: file_id=msg.video.file_id; ftype="video"
+        elif msg.animation: file_id=msg.animation.file_id; ftype="animation"
+        elif msg.document: file_id=msg.document.file_id; ftype="document"
+        elif msg.audio: file_id=msg.audio.file_id; ftype="audio"
+        elif msg.voice: file_id=msg.voice.file_id; ftype="voice"
+        else: return
+        item=(file_id,ftype,msg.caption or "",msg.caption_entities or []); pending=pending_batches.get(uid)
+        if pending is not None: pending.append(item); await msg.reply_text(f"✅ Ditambahkan ke batch. Total: {len(pending)}",protect_content=False); return
+        code=create_file_record(*item); await msg.reply_text(f"✅ File tersimpan!\n\n🔗 Link:\nhttps://t.me/{context.bot.username}?start={code}\n\nCode: {code}",protect_content=False); return
 
 
 async def admin_text_input(update,context):
     uid=update.effective_user.id
     if not is_admin(uid): return
     msg=update.message; s=admin_sessions.get(uid); action=s.get("action") if s else None
-    if action=="broadcast":
-        s["broadcast_message_id"]=msg.message_id; s["broadcast_chat_id"]=uid; s["action"]="broadcast_confirm"; await msg.reply_text("📢 Pesan siap dibroadcast.\n\nKetik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal."); return
+    if action=="broadcast": s["broadcast_message_id"]=msg.message_id; s["broadcast_chat_id"]=uid; s["action"]="broadcast_confirm"; await msg.reply_text("📢 Pesan siap dibroadcast.\n\nKetik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal.",protect_content=False); return
     if action=="add_command":
         m=re.match(r"^/?([a-zA-Z0-9_]+)\s*\|\s*(.+)$",msg.text.strip())
-        if not m: await msg.reply_text("Format salah. Contoh: /help | Bantuan Nakahoshi"); return
+        if not m: await msg.reply_text("Format salah. Contoh: /help | Bantuan Nakahoshi",protect_content=False); return
         cmd,desc=m.group(1).lower(),m.group(2); reserved={"start","admin","batch","done","cancelbatch","cancel","broadcast","broadcast_confirm","setpayment","setchannel","setgroup","setowner"}
-        if cmd in reserved: await msg.reply_text("❌ Nama command dipakai sistem/admin."); return
+        if cmd in reserved: await msg.reply_text("❌ Nama command dipakai sistem/admin.",protect_content=False); return
         conn=db(); exists=conn.execute("SELECT 1 FROM user_commands WHERE command=?",(cmd,)).fetchone()
-        if exists: conn.close(); await msg.reply_text("❌ Command sudah ada."); return
-        cfg=cfg_json("Tulis isi command ini..."); conn.execute("INSERT INTO user_commands(command,description,config,enabled) VALUES(?,?,?,1)",(cmd,desc,json.dumps(cfg,ensure_ascii=False))); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await refresh_command_menus(context.bot); await msg.reply_text(f"✅ /{cmd} dibuat. Buka /admin → User Command untuk mengaturnya."); return
+        if exists: conn.close(); await msg.reply_text("❌ Command sudah ada.",protect_content=False); return
+        cfg=cfg_json("Tulis isi command ini..."); conn.execute("INSERT INTO user_commands(command,description,config,enabled) VALUES(?,?,?,1)",(cmd,desc,json.dumps(cfg,ensure_ascii=False))); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await refresh_command_menus(context.bot); await msg.reply_text(f"✅ /{cmd} dibuat. Buka /admin → User Command untuk mengaturnya.",protect_content=False); return
     if action=="add_admin":
         try: new=int(msg.text.strip())
-        except: await msg.reply_text("❌ User ID harus angka."); return
-        conn=db(); conn.execute("INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)",(new,datetime.now().isoformat(timespec="seconds"),uid)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"✅ {new} sekarang admin."); return
+        except: await msg.reply_text("❌ User ID harus angka.",protect_content=False); return
+        conn=db(); conn.execute("INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)",(new,datetime.now().isoformat(timespec="seconds"),uid)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"✅ {new} sekarang admin.",protect_content=False); return
     if action=="del_admin":
         try: new=int(msg.text.strip())
-        except: await msg.reply_text("❌ User ID harus angka."); return
-        if new==OWNER_ID: await msg.reply_text("🚫 Owner utama tidak dapat dihapus."); return
-        conn=db(); conn.execute("DELETE FROM admins WHERE user_id=?",(new,)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"🗑️ Admin {new} dihapus."); return
+        except: await msg.reply_text("❌ User ID harus angka.",protect_content=False); return
+        if new==OWNER_ID: await msg.reply_text("🚫 Owner utama tidak dapat dihapus.",protect_content=False); return
+        conn=db(); conn.execute("DELETE FROM admins WHERE user_id=?",(new,)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"🗑️ Admin {new} dihapus.",protect_content=False); return
     if action in ("ban","unban"):
         raw=msg.text.strip(); parts=raw.split("|",1)
         try: target=int(parts[0].strip())
-        except: await msg.reply_text("❌ User ID harus angka."); return
+        except: await msg.reply_text("❌ User ID harus angka.",protect_content=False); return
         if action=="ban":
-            if target in get_admin_ids(): await msg.reply_text("🚫 Admin tidak dapat dibanned."); return
-            reason=parts[1].strip() if len(parts)>1 else ""; conn=db(); conn.execute("INSERT OR REPLACE INTO banned_users(user_id,reason,banned_at,banned_by) VALUES(?,?,?,?)",(target,reason,datetime.now().isoformat(timespec="seconds"),uid)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"🔨 User {target} berhasil dibanned.")
+            if target in get_admin_ids(): await msg.reply_text("🚫 Admin tidak dapat dibanned.",protect_content=False); return
+            reason=parts[1].strip() if len(parts)>1 else ""; conn=db(); conn.execute("INSERT OR REPLACE INTO banned_users(user_id,reason,banned_at,banned_by) VALUES(?,?,?,?)",(target,reason,datetime.now().isoformat(timespec="seconds"),uid)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"🔨 User {target} berhasil dibanned.",protect_content=False)
         else:
-            conn=db(); conn.execute("DELETE FROM banned_users WHERE user_id=?",(target,)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"♻️ User {target} berhasil di-unban.")
+            conn=db(); conn.execute("DELETE FROM banned_users WHERE user_id=?",(target,)); conn.commit(); conn.close(); admin_sessions.pop(uid,None); await msg.reply_text(f"♻️ User {target} berhasil di-unban.",protect_content=False)
         return
     if action=="ad_time":
         try: minutes=int(msg.text.strip()); assert minutes>=1
-        except: await msg.reply_text("❌ Masukkan angka menit minimal 1."); return
-        set_setting("auto_delete_minutes",str(minutes)); admin_sessions.pop(uid,None); await msg.reply_text(f"⏱️ Auto Delete diatur {minutes} menit."); return
-    if action=="edit_text":
-        s["draft"]["text"]=msg.text; s["draft"]["entities"]=serialize_entities(msg.entities); s["action"]="editor"; await msg.reply_text("📝 Text masuk draft. Formatting Telegram ikut disimpan. Belum disimpan.",reply_markup=editor_menu(uid,s["target"])); return
-    if action=="add_button":
-        m=re.match(r"^(.+?)\s*\|\s*(https?://\S+)$",msg.text.strip())
-        if not m: await msg.reply_text("Format salah: Nama Tombol | URL"); return
-        s["draft"].setdefault("buttons",[]).append([m.group(1).strip(),"url",m.group(2).strip()]); s["action"]="editor"; await msg.reply_text("🔘 Button ditambahkan ke draft.",reply_markup=editor_menu(uid,s["target"])); return
-    if action=="edit_button":
-        m=re.match(r"^(.+?)\s*\|\s*(https?://\S+)$",msg.text.strip()); idx=s.get("button_index")
-        if not m or idx is None: await msg.reply_text("Format salah: Nama Tombol | URL"); return
-        s["draft"]["buttons"][idx]=[m.group(1).strip(),"url",m.group(2).strip()]; s["action"]="editor"; await msg.reply_text("✏️ Button diperbarui di draft.",reply_markup=editor_menu(uid,s["target"])); return
+        except: await msg.reply_text("❌ Masukkan angka menit minimal 1.",protect_content=False); return
+        set_setting("auto_delete_minutes",str(minutes)); admin_sessions.pop(uid,None); await msg.reply_text(f"⏱️ Auto Delete diatur {minutes} menit.",protect_content=False); return
+    if action=="edit_text": s["draft"]["text"]=msg.text or ""; s["draft"]["entities"]=serialize_entities(msg.entities); s["action"]="editor"; await msg.reply_text("📝 Text masuk draft. Formatting + Premium Custom Emoji ikut disimpan. Belum disimpan.",reply_markup=editor_menu(uid,s["target"]),protect_content=False); return
+    if action=="edit_desc":
+        target=s.get("target",""); command=target[4:] if target.startswith("cmd/") else ""; desc=(msg.text or "").strip()[:256]
+        if command:
+            conn=db(); conn.execute("UPDATE user_commands SET description=? WHERE command=?",(desc,command)); conn.commit(); conn.close(); await refresh_command_menus(context.bot)
+        s["action"]="editor"; await msg.reply_text("🗒️ Deskripsi command berhasil diubah.",reply_markup=editor_menu(uid,target),protect_content=False); return
+    if action in ("add_button","edit_button"):
+        parts=[x.strip() for x in (msg.text or "").split("|")]; idx=s.get("button_index") if action=="edit_button" else None
+        if len(parts)<2 or not re.match(r"^https?://\S+$",parts[1]): await msg.reply_text("Format salah: Nama Tombol | URL | #g/#r/#p | custom_emoji_id",protect_content=False); return
+        label,url=parts[0],parts[1]; style=None; icon=None
+        for p in parts[2:]:
+            if p in {"#g","#G"}: style="success"
+            elif p in {"#r","#R"}: style="danger"
+            elif p in {"#p","#P"}: style="primary"
+            elif p: icon=p
+        for ent in msg.entities or []:
+            if ent.type=="custom_emoji" and getattr(ent,"custom_emoji_id",None): icon=ent.custom_emoji_id; break
+        if action=="add_button":
+            s["draft"].setdefault("buttons",[]).append([label,"url",url,style,icon,"new"])
+            # A separate &&-delimited button can be added by sending it as another line; keep the syntax simple and stable.
+            for extra in [x.strip() for x in label.split("&&")][1:]:
+                if extra: s["draft"]["buttons"].append([extra,"url",url,style,icon,"same"])
+        else:
+            if idx is None: await msg.reply_text("❌ Button yang diedit tidak ditemukan.",protect_content=False); return
+            old=s["draft"]["buttons"][idx]; same=old[5] if len(old)>5 else "new"; s["draft"]["buttons"][idx]=[label,"url",url,style,icon,same]
+        s["action"]="editor"; await msg.reply_text("🔘 Button tersimpan di draft. Belum disimpan permanen.",reply_markup=editor_menu(uid,s["target"]),protect_content=False); return
 
 
 async def cancel_command(update,context):
-    if is_admin(update.effective_user.id): admin_sessions.pop(update.effective_user.id,None); pending_batches.pop(update.effective_user.id,None); await update.message.reply_text("❌ Dibatalkan.")
+    uid=update.effective_user.id
+    if is_admin(uid):
+        s=admin_sessions.get(uid,{})
+        if s.get("target"):
+            target=s["target"]; s["draft"]=json.loads(json.dumps(load_target(target),ensure_ascii=False)); s["action"]="editor"; await update.message.reply_text("❌ Perubahan langkah ini dibatalkan. Draft kembali ke versi tersimpan.",reply_markup=editor_menu(uid,target),protect_content=False)
+        else: clear_session(uid); await update.message.reply_text("❌ Dibatalkan.",protect_content=False)
 
 
 async def batch_command(update,context):
     if not is_admin(update.effective_user.id): return
-    pending_batches[update.effective_user.id]=[]; await update.message.reply_text("📦 MODE BATCH AKTIF\n\nKirim file. Setelah selesai ketik /done.\nBatal: /cancelbatch")
+    pending_batches[update.effective_user.id]=[]; await update.message.reply_text("📦 MODE BATCH AKTIF\n\nKirim file. Setelah selesai ketik /done.\nBatal: /cancelbatch",protect_content=False)
 
 async def done_command(update,context):
     uid=update.effective_user.id
     if not is_admin(uid): return
     items=pending_batches.pop(uid,None)
-    if items is None: await update.message.reply_text("Tidak ada batch aktif."); return
-    if not items: await update.message.reply_text("❌ Batch kosong."); return
-    code=create_batch(uid,items); await update.message.reply_text(f"✅ BATCH SELESAI\n\n📦 Total: {len(items)}\n🔗 https://t.me/{context.bot.username}?start={code}\n\nCode: {code}")
-
+    if items is None: await update.message.reply_text("Tidak ada batch aktif.",protect_content=False); return
+    if not items: await update.message.reply_text("❌ Batch kosong.",protect_content=False); return
+    code=create_batch(uid,items); await update.message.reply_text(f"✅ BATCH SELESAI\n\n📦 Total: {len(items)}\n🔗 https://t.me/{context.bot.username}?start={code}\n\nCode: {code}",protect_content=False)
 
 async def start_broadcast(update,context):
     uid=update.effective_user.id
     if not is_admin(uid): return
-    admin_sessions[uid]={"action":"broadcast"}
-    await update.message.reply_text("📢 BROADCAST\n\nKirim satu pesan/media yang ingin dibroadcast.\nSetelah itu ketik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal.",protect_content=protect())
-
+    admin_sessions[uid]={"action":"broadcast"}; await update.message.reply_text("📢 BROADCAST\n\nKirim satu pesan/media yang ingin dibroadcast.\nSetelah itu ketik /broadcast_confirm untuk KIRIM ke semua user, atau /cancel untuk batal.",protect_content=False)
 
 async def broadcast_confirm(update,context):
     uid=update.effective_user.id
     if not is_admin(uid): return
     s=admin_sessions.get(uid)
-    if not s or s.get("action")!="broadcast_confirm" or not s.get("broadcast_message_id"): await update.message.reply_text("Tidak ada broadcast yang menunggu. Jalankan /broadcast dulu."); return
+    if not s or s.get("action")!="broadcast_confirm" or not s.get("broadcast_message_id"): await update.message.reply_text("Tidak ada broadcast yang menunggu. Jalankan /broadcast dulu.",protect_content=False); return
     conn=db(); users=[r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]; conn.close(); ok=bad=0
     for target in users:
-        try: await context.bot.copy_message(chat_id=target,from_chat_id=uid,message_id=s["broadcast_message_id"],protect_content=protect()); ok+=1
+        try: await context.bot.copy_message(chat_id=target,from_chat_id=uid,message_id=s["broadcast_message_id"],protect_content=True); ok+=1
         except Exception: bad+=1
         await asyncio.sleep(0.04)
-    admin_sessions.pop(uid,None); await update.message.reply_text(f"📢 BROADCAST SELESAI\n\n✅ Terkirim: {ok}\n❌ Gagal: {bad}")
-
+    admin_sessions.pop(uid,None); await update.message.reply_text(f"📢 BROADCAST SELESAI\n\n✅ Terkirim: {ok}\n❌ Gagal: {bad}",protect_content=False)
 
 async def generic_command(update,context):
     cmd=update.message.text.split()[0].lstrip("/").split("@")[0].lower()
@@ -612,54 +671,25 @@ async def generic_command(update,context):
     row=user_command(cmd)
     if row and row["enabled"]: await show_page(update,context,cmd)
 
-
 async def set_link(update,context,key,label):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("Gunakan command dengan URL."); return
-    set_setting(key," ".join(context.args).strip()); await update.message.reply_text(f"✅ {label} berhasil diubah.")
-
+    if not context.args: await update.message.reply_text("Gunakan command dengan URL.",protect_content=False); return
+    set_setting(key," ".join(context.args).strip()); await update.message.reply_text(f"✅ {label} berhasil diubah.",protect_content=False)
 async def setpayment(update,context): await set_link(update,context,"payment_link","Payment link")
 async def setchannel(update,context): await set_link(update,context,"channel_link","Channel link")
 async def setgroup(update,context): await set_link(update,context,"free_group_link","Group link")
 async def setowner(update,context): await set_link(update,context,"owner_link","Owner link")
 
-
 async def refresh_command_menus(bot):
-    conn=db(); rows=conn.execute("SELECT command,description FROM user_commands WHERE enabled=1 ORDER BY rowid").fetchall(); conn.close()
-    user_cmds=[BotCommand("start","Buka bot / akses file")]+[BotCommand(r["command"],r["description"][:256]) for r in rows]
-    await bot.set_my_commands(user_cmds,scope=BotCommandScopeDefault())
-    admin_cmds=user_cmds+[BotCommand("admin","Admin panel"),BotCommand("batch","Mulai batch file"),BotCommand("done","Selesaikan batch"),BotCommand("cancelbatch","Batalkan batch"),BotCommand("cancel","Batalkan proses"),BotCommand("broadcast","Broadcast"),BotCommand("broadcast_confirm","Konfirmasi broadcast")]
+    conn=db(); rows=conn.execute("SELECT command,description FROM user_commands WHERE enabled=1 ORDER BY rowid").fetchall(); conn.close(); user_cmds=[BotCommand("start","Buka bot / akses file")]+[BotCommand(r["command"],(r["description"] or "")[:256]) for r in rows]; await bot.set_my_commands(user_cmds,scope=BotCommandScopeDefault()); admin_cmds=user_cmds+[BotCommand("admin","Admin panel"),BotCommand("batch","Mulai batch file"),BotCommand("done","Selesaikan batch"),BotCommand("cancelbatch","Batalkan batch"),BotCommand("cancel","Batalkan proses"),BotCommand("broadcast","Broadcast"),BotCommand("broadcast_confirm","Konfirmasi broadcast")]
     for uid in get_admin_ids():
         try: await bot.set_my_commands(admin_cmds,scope=BotCommandScopeChat(chat_id=uid))
         except Exception as e: print("set admin commands error",uid,e)
 
-
 async def post_init(application): await refresh_command_menus(application.bot)
-
 async def error_handler(update,context): print("ERROR:",context.error)
 
-
 def main():
-    init_db()
-    app=Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("admin",admin_command))
-    app.add_handler(CommandHandler("batch",batch_command))
-    app.add_handler(CommandHandler("done",done_command))
-    app.add_handler(CommandHandler("cancelbatch",cancel_command))
-    app.add_handler(CommandHandler("cancel",cancel_command))
-    app.add_handler(CommandHandler("broadcast",start_broadcast))
-    app.add_handler(CommandHandler("broadcast_confirm",broadcast_confirm))
-    app.add_handler(CommandHandler("setpayment",setpayment)); app.add_handler(CommandHandler("setchannel",setchannel)); app.add_handler(CommandHandler("setgroup",setgroup)); app.add_handler(CommandHandler("setowner",setowner))
-    app.add_handler(CallbackQueryHandler(check_button,pattern=r"^check:"))
-    app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^edit:"))
-    app.add_handler(CallbackQueryHandler(button_callback,pattern=r"^btn:"))
-    app.add_handler(MessageHandler(filters.PHOTO|filters.VIDEO|filters.ANIMATION|filters.Document.ALL|filters.AUDIO,receive_admin_media))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,admin_text_input))
-    app.add_handler(MessageHandler(filters.COMMAND,generic_command))
-    app.add_error_handler(error_handler)
-    print("Bot sedang berjalan...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build(); app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("admin",admin_command)); app.add_handler(CommandHandler("batch",batch_command)); app.add_handler(CommandHandler("done",done_command)); app.add_handler(CommandHandler("cancelbatch",cancel_command)); app.add_handler(CommandHandler("cancel",cancel_command)); app.add_handler(CommandHandler("broadcast",start_broadcast)); app.add_handler(CommandHandler("broadcast_confirm",broadcast_confirm)); app.add_handler(CommandHandler("setpayment",setpayment)); app.add_handler(CommandHandler("setchannel",setchannel)); app.add_handler(CommandHandler("setgroup",setgroup)); app.add_handler(CommandHandler("setowner",setowner)); app.add_handler(CallbackQueryHandler(check_button,pattern=r"^check:")); app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|edit:)")); app.add_handler(CallbackQueryHandler(button_callback,pattern=r"^btn:")); media_filters=filters.PHOTO|filters.VIDEO|filters.ANIMATION|filters.Document.ALL|filters.AUDIO|filters.VOICE|filters.VIDEO_NOTE; app.add_handler(MessageHandler(media_filters,receive_admin_media)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,admin_text_input)); app.add_handler(MessageHandler(filters.COMMAND,generic_command)); app.add_error_handler(error_handler); print("Bot sedang berjalan..."); app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__": main()
