@@ -998,3 +998,65 @@ async def set_link(update,context,key,label):
 
 async def setpayment(update,context): await set_link(update,context,"payment_link","Payment link")
 async def setchannel(update,context): await set_link(update,context,"channel_link","Channel link")
+async def setgroup(update,context):
+    await set_link(update,context,"free_group_link","Group link")
+
+async def setowner(update,context):
+    await set_link(update,context,"owner_link","Owner link")
+
+async def refresh_command_menus(bot):
+    conn=db()
+    rows=conn.execute("SELECT command,description FROM user_commands WHERE enabled=1 ORDER BY rowid").fetchall()
+    conn.close()
+    user_cmds=[BotCommand("start","Buka bot / akses file")]
+    user_cmds += [BotCommand(r["command"],(r["description"] or "")[:256]) for r in rows]
+    await bot.set_my_commands(user_cmds,scope=BotCommandScopeDefault())
+    admin_cmds=user_cmds+[
+        BotCommand("admin","Admin panel"),
+        BotCommand("batch","Mulai batch file"),
+        BotCommand("done","Selesaikan batch"),
+        BotCommand("cancelbatch","Batalkan batch"),
+        BotCommand("cancel","Batalkan proses"),
+        BotCommand("broadcast","Broadcast"),
+        BotCommand("broadcast_confirm","Konfirmasi broadcast"),
+    ]
+    for uid in get_admin_ids():
+        try:
+            await bot.set_my_commands(admin_cmds,scope=BotCommandScopeChat(chat_id=uid))
+        except Exception as e:
+            print("set admin commands error",uid,e)
+
+async def post_init(application):
+    await refresh_command_menus(application.bot)
+
+async def error_handler(update,context):
+    print("ERROR:",context.error)
+
+def main():
+    init_db()
+    app=Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("admin",admin_command))
+    app.add_handler(CommandHandler("batch",batch_command))
+    app.add_handler(CommandHandler("done",done_command))
+    app.add_handler(CommandHandler("cancelbatch",cancel_command))
+    app.add_handler(CommandHandler("cancel",cancel_command))
+    app.add_handler(CommandHandler("broadcast",start_broadcast))
+    app.add_handler(CommandHandler("broadcast_confirm",broadcast_confirm))
+    app.add_handler(CommandHandler("setpayment",setpayment))
+    app.add_handler(CommandHandler("setchannel",setchannel))
+    app.add_handler(CommandHandler("setgroup",setgroup))
+    app.add_handler(CommandHandler("setowner",setowner))
+    app.add_handler(CallbackQueryHandler(check_button,pattern=r"^check:"))
+    app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|edit:)"))
+    app.add_handler(CallbackQueryHandler(button_callback,pattern=r"^btn:"))
+    media_filters=filters.PHOTO|filters.VIDEO|filters.ANIMATION|filters.Document.ALL|filters.AUDIO|filters.VOICE|filters.VIDEO_NOTE
+    app.add_handler(MessageHandler(media_filters,receive_admin_media))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,admin_text_input))
+    app.add_handler(MessageHandler(filters.COMMAND,generic_command))
+    app.add_error_handler(error_handler)
+    print("Bot sedang berjalan...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__=="__main__":
+    main()
